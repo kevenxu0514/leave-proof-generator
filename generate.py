@@ -24,8 +24,10 @@ from copy import deepcopy
 from datetime import date, timedelta
 
 from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import parse_xml
 from docx.oxml.ns import qn, nsdecls
+from docx.shared import Pt
 import pymupdf
 
 WORK = os.path.dirname(os.path.abspath(__file__))
@@ -39,8 +41,12 @@ def _slot_ranges_sk(full):
 
 
 def _slot_ranges_fs(full):
-    """分寝室：固定 兹证明 | S1 宿舍楼 | 固定 下列名单中同学，因参加 | S2 日期（星期） | S3 参加…， | 固定后缀"""
-    m1 = re.search(r'[一二三四五六七八九十]+舍', full)
+    """分寝室：固定 兹证明 | S1 宿舍楼 | 固定 下列名单中同学，因参加 | S2 日期（星期） | S3 参加…， | 固定后缀
+
+    楼号既可能是模板里的中文写法（七舍），也可能是生成后的阿拉伯数字写法（12舍），
+    两种都要能定位——否则替换完第一个槽位后，第二个槽位就再也找不到锚点了。
+    """
+    m1 = re.search(r'[一二三四五六七八九十\d]+舍', full)
     m2 = re.search(r'\d{4}年\d{1,2}月\d{1,2}日（星期[一二三四五六日]）', full)
     end3 = full.find('故需请假，特此证明！')
     if not m1 or not m2 or end3 < 0:
@@ -58,7 +64,8 @@ TEMPLATES = {
     '分寝室请假': dict(
         file='分寝室请假模板.docx',
         headers=['姓名', '班级', '学号', '寝室号'],
-        required=['event_date', 'dorm', 'activity', 'special_note'],
+        # 楼号不再手填，自动从名单的寝室信息里识别
+        required=['event_date', 'activity', 'special_note'],
         slot_ranges=_slot_ranges_fs,
     ),
 }
@@ -133,6 +140,69 @@ def build_period_text(values):
     for w in dict.fromkeys(warns):
         print(f'  [提示] {w}')
     return '、'.join(out)
+
+
+# ---------------- 寝室信息规范化 ----------------
+
+CN_DIGITS = {'一': 1, '二': 2, '三': 3, '四': 4, '五': 5,
+             '六': 6, '七': 7, '八': 8, '九': 9}
+BUILDING_RE = re.compile(r'(\d+|[一二三四五六七八九十]+)\s*(?:舍|号楼|号公寓|号宿舍楼|公寓|栋)')
+DISTRICT_RE = re.compile(r'[一二三四五六七八九十\d]+\s*区')
+FULLWIDTH_DIGITS = str.maketrans('０１２３４５６７８９', '0123456789')
+
+
+def cn_num_to_int(text):
+    """中文数字转整数：'十二'->12、'二十'->20、'八'->8；阿拉伯数字原样返回"""
+    t = str(text or '').strip().translate(FULLWIDTH_DIGITS)
+    if not t:
+        return None
+    if t.isdigit():
+        return int(t)
+    total, section = 0, 0
+    for ch in t:
+        if ch in CN_DIGITS:
+            section = CN_DIGITS[ch]
+        elif ch == '十':
+            section = (section or 1) * 10
+            total += section
+            section = 0
+        else:
+            return None
+    return total + section
+
+
+def parse_dorm(raw):
+    """
+    解析原始寝室信息，返回 (楼号int|None, 寝室号str|None)。
+
+    各组织表单写法不统一，这里统一规范：
+      '8舍'                -> (8, None)        只有楼号，缺寝室号
+      '十二舍二区'          -> (12, None)       区号丢弃
+      '十二舍一区二区301'    -> (12, '301')     多区号一并丢弃
+      '12舍301'            -> (12, '301')
+      '8号楼3层301'         -> (8, '301')
+      '301'                -> (None, '301')    只有寝室号，缺楼号
+    """
+    s = str(raw or '').strip().translate(FULLWIDTH_DIGITS)
+    if not s:
+        return None, None
+
+    building = None
+    m = BUILDING_RE.search(s)
+    if m:
+        building = cn_num_to_int(m.group(1))
+        s = s[:m.start()] + ' ' + s[m.end():]
+
+    s = DISTRICT_RE.sub(' ', s)          # 楼区号一律丢弃
+
+    rooms = re.findall(r'\d+', s)
+    room = max(rooms, key=len) if rooms else None
+    return building, room
+
+
+def norm_building(n):
+    """楼号 -> 统一写法 '12舍'"""
+    return f'{n}舍' if n is not None else ''
 
 
 # ---------------- 输入读取 ----------------
@@ -292,13 +362,15 @@ def layout_table(tbl, headers, rows, section, max_size=16, min_size=12):
     return size
 
 
-def make_runs(p, values, sz_half=32):
+def make_runs(p, values, sz_half=32, red=False):
     for r in p.findall(qn('w:r')):
         p.remove(r)
     for val in values:
+        color = '<w:color w:val="FF0000"/>' if red else ''
         r = parse_xml(
             f'<w:r {nsdecls("w")}><w:rPr><w:rFonts w:hint="eastAsia" '
             f'w:ascii="仿宋" w:hAnsi="仿宋" w:eastAsia="仿宋"/>'
+            f'{color}'
             f'<w:sz w:val="{sz_half}"/><w:szCs w:val="{sz_half}"/></w:rPr>'
             f'<w:t xml:space="preserve">{val}</w:t></w:r>')
         p.append(r)
@@ -372,7 +444,8 @@ def fill_body(body_p, slot_values, slot_ranges):
                 r.getparent().remove(r)
 
 
-def build(src, dst, students, segs, slot_values, sign_date, slot_ranges, blank_lines=2):
+def build(src, dst, students, segs, slot_values, sign_date, slot_ranges,
+          blank_lines=2, red_cells=()):
     doc = Document(src)
     body = doc.element.body
     src_tbl = doc.tables[0]._tbl
@@ -397,7 +470,7 @@ def build(src, dst, students, segs, slot_values, sign_date, slot_ranges, blank_l
         p._p.getparent().remove(p._p)
 
     anchor = paras[1]._p
-    student_iter = iter(students)
+    gi = 0                     # 学生在整份名单中的序号，用于定位需要标红的单元格
     for si, seg in enumerate(segs):
         new_tbl = deepcopy(src_tbl)
         rows = new_tbl.findall(qn('w:tr'))
@@ -416,9 +489,11 @@ def build(src, dst, students, segs, slot_values, sign_date, slot_ranges, blank_l
             trPr0.append(parse_xml(f'<w:tblHeader {nsdecls("w")}/>'))
         for tr in data_trs[:seg]:
             tcs = tr.findall(qn('w:tc'))
-            vals = next(student_iter)
+            vals = students[gi]
             for ci, tc in enumerate(tcs[:len(vals)]):
-                make_runs(tc.find(qn('w:p')), [str(vals[ci])], sz_half=data_size * 2)
+                make_runs(tc.find(qn('w:p')), [str(vals[ci])],
+                          sz_half=data_size * 2, red=(gi, ci) in red_cells)
+            gi += 1
         anchor.addnext(new_tbl)
         anchor = new_tbl
 
@@ -448,6 +523,56 @@ def build(src, dst, students, segs, slot_values, sign_date, slot_ranges, blank_l
 
 
 # ---------------- 渲染与核验 ----------------
+
+def _set_font(run, name='仿宋', size_pt=12, bold=False):
+    run.font.name = name
+    run.font.size = Pt(size_pt)
+    run.bold = bold
+    rpr = run._element.get_or_add_rPr()
+    rfonts = rpr.find(qn('w:rFonts'))
+    if rfonts is None:
+        rfonts = parse_xml(f'<w:rFonts {nsdecls("w")}/>')
+        rpr.insert(0, rfonts)
+    for attr in ('w:ascii', 'w:hAnsi', 'w:eastAsia'):
+        rfonts.set(qn(attr), name)
+
+
+INCOMPLETE_HEADERS = ['姓名', '班级', '学号', '原填写内容', '缺失项']
+
+
+def write_incomplete_report(path, records, title='信息不全人员名单（缺寝室楼号，需人工补充）'):
+    """
+    把信息不全的人单独列成一张表，便于二次统计补录。
+    records: [{'姓名':..,'班级':..,'学号':..,'原填写内容':..,'缺失项':..}, ...]
+    """
+    doc = Document()
+    normal = doc.styles['Normal']
+    normal.font.name = '仿宋'
+    normal.font.size = Pt(12)
+    normal.element.rPr.rFonts.set(qn('w:eastAsia'), '仿宋')
+
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _set_font(p.add_run(title), '黑体', 16, True)
+
+    tip = doc.add_paragraph()
+    tip.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _set_font(tip.add_run(f'共 {len(records)} 人，请补齐寝室楼号后重新生成正式证明。'), '仿宋', 12)
+
+    tbl = doc.add_table(rows=1, cols=len(INCOMPLETE_HEADERS))
+    tbl.style = 'Table Grid'
+    for i, h in enumerate(INCOMPLETE_HEADERS):
+        cell = tbl.rows[0].cells[i]
+        cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _set_font(cell.paragraphs[0].add_run(h), '仿宋', 14, True)
+    for rec in records:
+        cells = tbl.add_row().cells
+        for i, h in enumerate(INCOMPLETE_HEADERS):
+            cells[i].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+            _set_font(cells[i].paragraphs[0].add_run(str(rec.get(h, ''))), '仿宋', 14)
+    doc.save(path)
+    return path
+
 
 def render_pdf(docx_path):
     # Word COM 以自身进程目录（常为 C:\WINDOWS\system32）解析相对路径，
@@ -533,12 +658,14 @@ def compute_segs(n, F1, F2):
     return segs
 
 
-def solve(src, dst, students, slot_values, sign_date, slot_ranges, init_caps=(7, 11)):
+def solve(src, dst, students, slot_values, sign_date, slot_ranges,
+          init_caps=(7, 11), red_cells=()):
     F1, F2 = init_caps
     last_pdf = None
     for rnd in range(1, MAX_ROUNDS + 1):
         segs = compute_segs(len(students), F1, F2)
-        build(src, dst, students, segs, slot_values, sign_date, slot_ranges, BLANK_LINES)
+        build(src, dst, students, segs, slot_values, sign_date, slot_ranges,
+              BLANK_LINES, red_cells)
         pdf = render_pdf(dst)
         last_pdf = pdf
         problems, infos = verify_pdf(pdf)
@@ -582,6 +709,38 @@ def solve(src, dst, students, slot_values, sign_date, slot_ranges, init_caps=(7,
 
 # ---------------- 主流程 ----------------
 
+# 各组织收集的表单列名不统一，按别名定位
+COLUMN_ALIASES = {
+    '姓名': ['姓名', '名字', '学生姓名', '同学'],
+    '班级': ['班级', '行政班级', '所在班级', '班'],
+    '学号': ['学号', '学生证号', '学籍号'],
+    '学院': ['学院', '所在学院', '院系', '二级学院'],
+    '寝室号': ['寝室号', '寝室', '宿舍', '宿舍号', '寝室信息', '宿舍信息', '房间号', '住所'],
+    '节次': ['节次', '请假节次', '请假课时', '上课节次', '请假时间', '课程节次'],
+}
+
+
+def resolve_column(header, field):
+    """按别名把模板字段映射到源表列下标，精确优先、包含次之"""
+    aliases = COLUMN_ALIASES.get(field, [field])
+    for al in aliases:
+        for i, h in enumerate(header):
+            if h == al:
+                return i
+    for al in aliases:
+        for i, h in enumerate(header):
+            if h and al in h:
+                return i
+    return None
+
+
+def find_template(tpl):
+    for cand in (os.path.join(WORK, '模板', tpl['file']), os.path.join(WORK, tpl['file'])):
+        if os.path.exists(cand):
+            return cand
+    raise RuntimeError(f'模板文件不存在: {tpl["file"]}（需随包放在 模板/ 子目录或与 generate.py 同目录）')
+
+
 def main():
     ap = argparse.ArgumentParser(description='请假证明一键生成（乙方案）')
     ap.add_argument('input', help='输入文件 xlsx/csv/json')
@@ -589,68 +748,146 @@ def main():
     ap.add_argument('--name', default=None, help='输出文件名（默认自动）')
     args = ap.parse_args()
 
-    info, header, students = read_input(args.input)
+    info, header, students_raw = read_input(args.input)
 
     template_id = info.get('template') or info.get('模板')
     if not template_id:
-        if '学院' in header:
+        if resolve_column(header, '学院') is not None:
             template_id = '上课请假'
-        elif '寝室号' in header:
+        elif resolve_column(header, '寝室号') is not None:
             template_id = '分寝室请假'
     if template_id not in TEMPLATES:
         raise RuntimeError(f'未知模板: {template_id}（可选: {list(TEMPLATES)}）')
     tpl = TEMPLATES[template_id]
 
-    # 「请假节次」列 → 正文时间段：用户未提供 periods 时自动换算
-    # （该列不在模板表格里，但它是正文驱动列，不能当无效列丢掉）
-    if template_id == '上课请假' and not info.get('periods'):
-        pi = next((i for i, h in enumerate(header)
-                   if h and ('节次' in h or '请假时间' in h or '上课节次' in h)), None)
-        if pi is not None:
-            info['periods'] = build_period_text(
-                [r[pi] if pi < len(r) else '' for r in students])
-            print(f"[自动换算] 请假节次 -> {info['periods']}")
-
-    # 校验列头
-    missing = [h for h in tpl['headers'] if h not in header]
-    if missing:
-        raise RuntimeError(f'名单列头缺少: {missing}（应为 {tpl["headers"]}）')
-    col_idx = {h: header.index(h) for h in tpl['headers']}
-    students = [[row[col_idx[h]] if col_idx[h] < len(row) else '' for h in tpl['headers']]
-                for row in students]
-
-    missing_params = [f for f in tpl['required'] if not info.get(f)]
-    if missing_params:
-        raise RuntimeError(f'活动信息缺少字段: {missing_params}')
+    # 列定位（允许别名）
+    col_idx = {}
+    for h in tpl['headers']:
+        i = resolve_column(header, h)
+        if i is None:
+            raise RuntimeError(f'名单中找不到「{h}」列（表头为 {header}）')
+        col_idx[h] = i
 
     ev = parse_date(info['event_date'])
     sign = parse_date(info.get('sign_date') or info.get('落款日期') or (ev - timedelta(days=1)))
     wd = WEEKDAY_CN[ev.weekday()]
-    p = dict(y=ev.year, m=ev.month, d=ev.day, wd=wd)
-    if template_id == '上课请假':
-        slot_values = [f'{p["y"]}年{p["m"]}月{p["d"]}日({p["wd"]})',
-                       info['periods'].rstrip() + ' ',
-                       f"到{info['location']}出席{info['activity']}，志愿者活动，"]
-    else:
-        slot_values = [info['dorm'],
-                       f'{p["y"]}年{p["m"]}月{p["d"]}日（{p["wd"]}）',
-                       f"参加{info['activity']}志愿者工作，{info['special_note']}，"]
     sign_date = fmt_cn_date(sign)
+    src = find_template(tpl)
+    stamp = dict(y=ev.year, m=ev.month, d=ev.day, wd=wd)
 
-    src = None
-    for cand in (os.path.join(WORK, '模板', tpl['file']), os.path.join(WORK, tpl['file'])):
-        if os.path.exists(cand):
-            src = cand
-            break
-    if src is None:
-        raise RuntimeError(f'模板文件不存在: {tpl["file"]}（需与 generate.py 同目录或 模板/ 子目录）')
-    name = args.name or f'{template_id.replace("请假", "")}请假证明-{ev:%Y%m%d}.docx'
-    dst = os.path.join(args.out, name)
+    if template_id == '上课请假':
+        # 「请假节次」列 → 正文时间段（该列不进表格，但是正文驱动列，不能丢）
+        pt = resolve_column(header, '节次')
+        if not info.get('periods') and pt is not None:
+            info['periods'] = build_period_text(
+                [r[pt] if pt < len(r) else '' for r in students_raw])
+            print(f'[自动换算] 请假节次 -> {info["periods"]}')
+        missing = [f for f in tpl['required'] if not info.get(f)]
+        if missing:
+            raise RuntimeError(f'活动信息缺少字段: {missing}')
 
-    solve(src, dst, students, slot_values, sign_date, tpl["slot_ranges"])
-    print(f'\n输出: {dst}')
-    print(f'落款日期: {sign_date}  |  学生数: {len(students)}')
-    return dst
+        students = [[row[col_idx[h]] if col_idx[h] < len(row) else ''
+                     for h in tpl['headers']] for row in students_raw]
+        slot_values = [f'{stamp["y"]}年{stamp["m"]}月{stamp["d"]}日({stamp["wd"]})',
+                       str(info['periods']).rstrip() + ' ',
+                       f"到{info['location']}出席{info['activity']}，志愿者活动，"]
+        name = args.name or f'上课请假证明-{ev:%Y%m%d}.docx'
+        dst = os.path.join(args.out, name)
+        solve(src, dst, students, slot_values, sign_date, tpl['slot_ranges'])
+        print(f'\n输出: {dst}')
+        print(f'落款日期: {sign_date}  |  学生数: {len(students)}')
+        return [dst]
+
+    # ---------------- 分寝室请假：按楼号分组，每栋楼一份 ----------------
+    return run_dorm(src, args, info, tpl, col_idx, students_raw, stamp, sign_date)
+
+
+def run_dorm(src, args, info, tpl, col_idx, students_raw, stamp, sign_date):
+    missing = [f for f in tpl['required'] if not info.get(f)]
+    if missing:
+        raise RuntimeError(f'活动信息缺少字段: {missing}')
+
+    # 寝室列：楼号 + 寝室号 拆开，楼号统一为「数字+舍」，区号丢弃
+    di = col_idx['寝室号']
+
+    def cell(row, i):
+        v = row[i] if i < len(row) else ''
+        return '' if v is None else str(v).strip()
+
+    groups, incomplete, raw_of = {}, [], {}
+    for i, row in enumerate(students_raw):
+        raw = cell(row, di)
+        building, room = parse_dorm(raw)
+        raw_of[i] = raw
+        if building is None:
+            incomplete.append((i, raw, room))
+            continue
+        groups.setdefault(building, []).append((i, room))
+
+    if not groups and not incomplete:
+        raise RuntimeError('名单里没有任何可用的寝室信息')
+
+    outputs = []
+    for building in sorted(groups):
+        members = groups[building]
+        students, red_cells = [], set()
+        ci_room = tpl['headers'].index('寝室号')
+        for local_i, (gi, room) in enumerate(members):
+            row = students_raw[gi]
+            vals = [cell(row, col_idx[h]) for h in tpl['headers']]
+            if room:
+                vals[ci_room] = room
+            else:
+                # 只有楼号没有寝室号：保留原填写内容并标红，提示人工复检
+                vals[ci_room] = raw_of[gi]
+                red_cells.add((local_i, ci_room))
+            students.append(vals)
+
+        slot_values = [norm_building(building),
+                       f'{stamp["y"]}年{stamp["m"]}月{stamp["d"]}日（{stamp["wd"]}）',
+                       f"参加{info['activity']}志愿者工作，{info['special_note']}，"]
+        default_name = (f'分寝室请假证明-{norm_building(building)}-'
+                        f'{stamp["y"]:04d}{stamp["m"]:02d}{stamp["d"]:02d}.docx')
+        if args.name:
+            # 多个楼号时必须在文件名里区分，否则会互相覆盖
+            stem, ext = os.path.splitext(args.name)
+            name = f'{stem}-{norm_building(building)}{ext or ".docx"}' if len(groups) > 1 else args.name
+        else:
+            name = default_name
+        dst = os.path.join(args.out, name)
+        print(f'\n=== {norm_building(building)}：{len(students)} 人'
+              f'{"（含 " + str(len(red_cells)) + " 人缺寝室号，已标红）" if red_cells else ""} ===')
+        solve(src, dst, students, slot_values, sign_date, tpl['slot_ranges'], red_cells=red_cells)
+        outputs.append(dst)
+        print(f'输出: {dst}')
+
+    if incomplete:
+        recs = []
+        for gi, raw, room in incomplete:
+            row = students_raw[gi]
+            recs.append({
+                '姓名': cell(row, col_idx['姓名']),
+                '班级': cell(row, col_idx['班级']),
+                '学号': cell(row, col_idx['学号']),
+                '原填写内容': raw,
+                '缺失项': '缺寝室楼号' if raw else '寝室信息为空',
+            })
+        default_name = f'信息不全人员-{stamp["y"]:04d}{stamp["m"]:02d}{stamp["d"]:02d}.docx'
+        if args.name:
+            stem, ext = os.path.splitext(args.name)
+            name = f'{stem}-信息不全{ext or ".docx"}'
+        else:
+            name = default_name
+        dst = os.path.join(args.out, name)
+        write_incomplete_report(dst, recs)
+        outputs.append(dst)
+        print(f'\n=== 信息不全人员 {len(recs)} 人（缺寝室楼号，已单独成表）===')
+        for rec in recs:
+            print(f'  {rec["姓名"]}  {rec["班级"]}  {rec["学号"]}  原填写「{rec["原填写内容"]}」')
+        print(f'输出: {dst}')
+
+    print(f'\n落款日期: {sign_date}  |  楼号分组: {[norm_building(b) for b in sorted(groups)]}')
+    return outputs
 
 
 if __name__ == '__main__':
