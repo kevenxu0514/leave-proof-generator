@@ -1,18 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-第二步：给 Word 初版加盖印章，并导出 PDF。
+第二步（两小步）：给 Word 初版加盖印章，确认后再导出 PDF。
 
-流程（对应「两步交付」）：
-  第一步 generate.py 出 Word 初版 + 信息不全人员提示 → 人工复检
-  第二步 本脚本：使用者提供章印图片 → 白底透明化 → 浮于文字上方压到落款日期处 → 导出 PDF
+完整交付链路：
+  1) generate.py            出 Word 初版（含标红与信息不全提示）  -> 使用者确认
+  2) add_stamp.py --seal   加盖印章，只出 Word 预览              -> 使用者确认章的位置
+  3) add_stamp.py --pdf    对已确认的盖章 Word 导出最终 PDF
 
 用法:
+    # 2) 盖章，出预览 Word（不导 PDF）
     python add_stamp.py --docx 分寝室请假证明-8舍-20261011.docx --seal 章.png
 
+    # 3) 章的样式与位置确认无误后，导出最终 PDF
+    python add_stamp.py --docx 分寝室请假证明-8舍-20261011_盖章.docx --pdf
+
+    # 也可一步到位（章的位置已经调好时）
+    python add_stamp.py --docx 初版.docx --seal 章.png --pdf
+
 参数:
-    --docx        第一步产出的 Word 初版
-    --seal        章印图片（红章白底，png/jpg 均可）
-    --pdf         输出 PDF 路径（默认与盖章后的 docx 同名）
+    --docx        输入 Word（第 2 步传初版；第 3 步传已盖章的那份）
+    --seal        章印图片（红章白底）。给了就盖章
+    --pdf         导出 PDF。单独写 --pdf 用默认名；也可 --pdf 指定路径
     --docx-out    盖章后的 docx 路径（默认 <原名>_盖章.docx）
     --width-cm    章印宽度，默认 4.2cm，高度按原图比例
     --offset-x-cm 水平微调，负数左移，默认 0
@@ -105,10 +113,13 @@ def add_floating_image(paragraph, image_path, width_cm, offset_x_cm, offset_y_cm
 
 
 def main():
-    ap = argparse.ArgumentParser(description='给请假证明加盖印章并导出 PDF')
-    ap.add_argument('--docx', required=True, help='第一步产出的 Word 初版')
-    ap.add_argument('--seal', required=True, help='章印图片（红章白底）')
-    ap.add_argument('--pdf', default=None, help='输出 PDF 路径')
+    ap = argparse.ArgumentParser(description='给请假证明加盖印章，并在确认后导出 PDF')
+    ap.add_argument('--docx', required=True,
+                    help='输入 Word（盖章那步传初版；导 PDF 那步传已盖章的那份）')
+    ap.add_argument('--seal', default=None,
+                    help='章印图片（红章白底）。给了就盖章；已盖好章只导 PDF 时可省')
+    ap.add_argument('--pdf', nargs='?', const='auto', default=None,
+                    help='导出 PDF。单独写 --pdf 用默认名，也可 --pdf 路径')
     ap.add_argument('--docx-out', default=None, help='盖章后的 docx 路径')
     ap.add_argument('--width-cm', type=float, default=4.2, help='章印宽度 cm，默认 4.2')
     ap.add_argument('--offset-x-cm', type=float, default=0.0)
@@ -118,39 +129,47 @@ def main():
     args = ap.parse_args()
 
     if not os.path.exists(args.docx):
-        sys.exit(f'找不到 Word 初版: {args.docx}')
-    if not os.path.exists(args.seal):
-        sys.exit(f'找不到章印图片: {args.seal}')
+        sys.exit(f'找不到输入 Word: {args.docx}')
+    if not args.seal and args.pdf is None:
+        sys.exit('至少要指定一项：--seal 盖章出预览，或 --pdf 导出最终 PDF')
 
     base = os.path.splitext(os.path.abspath(args.docx))[0]
-    docx_out = args.docx_out or f'{base}_盖章.docx'
-    pdf_out = args.pdf or f'{base}_盖章.pdf'
 
-    # 1. 章印去白底
-    tmp_png = os.path.join(tempfile.gettempdir(), '_seal_transparent.png')
-    _, size = make_white_transparent(args.seal, tmp_png)
-    print(f'章印处理: {args.seal} -> 白底透明化 ({size[0]}x{size[1]})')
+    # ---- 盖章（只出 Word，供使用者确认章的位置）----
+    if args.seal:
+        if not os.path.exists(args.seal):
+            sys.exit(f'找不到章印图片: {args.seal}')
+        docx_out = args.docx_out or f'{base}_盖章.docx'
 
-    # 2. 插入浮动章
-    doc = Document(args.docx)
-    section = doc.sections[0]
-    col_width = section.page_width - section.left_margin - section.right_margin
-    dates = [p for p in doc.paragraphs if DATE_RE.match(p.text)]
-    if not dates:
-        sys.exit('文档里找不到落款日期段落，无法定位盖章位置')
-    targets = dates[:1] if args.first_page_only else dates
-    for p in targets:
-        add_floating_image(p, tmp_png, args.width_cm,
-                           args.offset_x_cm, args.offset_y_cm, col_width)
-    doc.save(docx_out)
-    print(f'盖章完成: {docx_out}（共 {len(targets)} 处落款）')
+        tmp_png = os.path.join(tempfile.gettempdir(), '_seal_transparent.png')
+        _, size = make_white_transparent(args.seal, tmp_png)
+        print(f'章印处理: {args.seal} -> 白底透明化 ({size[0]}x{size[1]})')
 
-    # 3. 导出 PDF
-    render_pdf(docx_out)
-    produced = os.path.splitext(docx_out)[0] + '.pdf'
-    if os.path.abspath(produced) != os.path.abspath(pdf_out):
-        os.replace(produced, pdf_out)
-    print(f'输出 PDF: {pdf_out}')
+        doc = Document(args.docx)
+        section = doc.sections[0]
+        col_width = section.page_width - section.left_margin - section.right_margin
+        dates = [p for p in doc.paragraphs if DATE_RE.match(p.text)]
+        if not dates:
+            sys.exit('文档里找不到落款日期段落，无法定位盖章位置')
+        targets = dates[:1] if args.first_page_only else dates
+        for p in targets:
+            add_floating_image(p, tmp_png, args.width_cm,
+                               args.offset_x_cm, args.offset_y_cm, col_width)
+        doc.save(docx_out)
+        print(f'盖章完成（预览用，尚未导出 PDF）: {docx_out}（共 {len(targets)} 处落款）')
+    else:
+        docx_out = os.path.abspath(args.docx)
+
+    # ---- 导出 PDF（使用者在 Word 里确认过章的样式与位置之后）----
+    if args.pdf is not None:
+        render_pdf(docx_out)
+        produced = os.path.splitext(docx_out)[0] + '.pdf'
+        pdf_out = (os.path.splitext(docx_out)[0] + '.pdf') if args.pdf == 'auto' else args.pdf
+        if os.path.abspath(produced) != os.path.abspath(pdf_out):
+            os.replace(produced, pdf_out)
+        print(f'最终 PDF: {pdf_out}')
+
+    return docx_out
 
 
 if __name__ == '__main__':

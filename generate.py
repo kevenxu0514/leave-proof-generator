@@ -674,6 +674,13 @@ def solve(src, dst, students, slot_values, sign_date, slot_ranges,
             log.append(f'  P{inf["page"]}: rows={inf["rows"]:2d} last_y={inf["last_y"]:6.1f}')
         if not problems:
             log.append('  核验全部通过 ✓')
+            # 渲染核验会顺手生成一个 PDF，它是「未盖章的初版预览」，不是最终交付物。
+            # 改名以免被误当成成品发出去（最终 PDF 由 add_stamp.py 产出）。
+            preview = os.path.splitext(dst)[0] + '_初版预览.pdf'
+            if last_pdf and os.path.exists(last_pdf) and \
+                    os.path.abspath(last_pdf) != os.path.abspath(preview):
+                os.replace(last_pdf, preview)
+            log.append(f'  初版预览: {os.path.basename(preview)}（未盖章，仅供确认）')
             print('\n'.join(log))
             return segs
         # 注意：verify_pdf 统计的 rows 含正文折行等左对齐文本块，不是真实表格行数，
@@ -720,6 +727,12 @@ COLUMN_ALIASES = {
 }
 
 
+def cell_value(row, i):
+    """安全取单元格文本，None 与越界都归一为 ''"""
+    v = row[i] if 0 <= i < len(row) else ''
+    return '' if v is None else str(v).strip()
+
+
 def resolve_column(header, field):
     """按别名把模板字段映射到源表列下标，精确优先、包含次之"""
     aliases = COLUMN_ALIASES.get(field, [field])
@@ -741,11 +754,34 @@ def find_template(tpl):
     raise RuntimeError(f'模板文件不存在: {tpl["file"]}（需随包放在 模板/ 子目录或与 generate.py 同目录）')
 
 
+def split_output_name(args, prefix, label, n_groups, date_str):
+    """拆分输出时的文件名：默认 {前缀}-{分组值}-{日期}.docx；给了 --name 也要带上分组值避免互相覆盖"""
+    if args.name:
+        if n_groups <= 1:
+            return args.name
+        stem, ext = os.path.splitext(args.name)
+        return f'{stem}-{label}{ext or ".docx"}'
+    return f'{prefix}-{label}-{date_str}.docx'
+
+
+def group_indices(students_raw, col):
+    """按某列的值分组，返回 {组名: [行下标, ...]}；空值归入「未填」。组名排序保证可复现"""
+    groups = {}
+    for i, row in enumerate(students_raw):
+        key = cell_value(row, col) or '未填'
+        groups.setdefault(key, []).append(i)
+    return {k: groups[k] for k in sorted(groups)}
+
+
 def main():
     ap = argparse.ArgumentParser(description='请假证明一键生成（乙方案）')
     ap.add_argument('input', help='输入文件 xlsx/csv/json')
     ap.add_argument('--out', default=WORK, help='输出目录（默认脚本目录）')
     ap.add_argument('--name', default=None, help='输出文件名（默认自动）')
+    ap.add_argument('--split', choices=['merged', 'college'], default='merged',
+                    help='上课请假的拆分方式：merged=合并输出（默认）/ college=按学院拆分')
+    ap.add_argument('--split-by', default=None,
+                    help='按指定列名拆分（如 --split-by 班级），优先于 --split')
     args = ap.parse_args()
 
     info, header, students_raw = read_input(args.input)
@@ -786,17 +822,45 @@ def main():
         if missing:
             raise RuntimeError(f'活动信息缺少字段: {missing}')
 
-        students = [[row[col_idx[h]] if col_idx[h] < len(row) else ''
-                     for h in tpl['headers']] for row in students_raw]
+        students = [[cell_value(row, col_idx[h]) for h in tpl['headers']]
+                    for row in students_raw]
         slot_values = [f'{stamp["y"]}年{stamp["m"]}月{stamp["d"]}日({stamp["wd"]})',
                        str(info['periods']).rstrip() + ' ',
                        f"到{info['location']}出席{info['activity']}，志愿者活动，"]
-        name = args.name or f'上课请假证明-{ev:%Y%m%d}.docx'
-        dst = os.path.join(args.out, name)
-        solve(src, dst, students, slot_values, sign_date, tpl['slot_ranges'])
-        print(f'\n输出: {dst}')
-        print(f'落款日期: {sign_date}  |  学生数: {len(students)}')
-        return [dst]
+
+        # 拆分方式：--split-by 优先，其次 --split college，都没有则合并输出
+        split_col = None
+        if args.split_by:
+            split_col = header.index(args.split_by) if args.split_by in header \
+                else resolve_column(header, args.split_by)
+            if split_col is None:
+                raise RuntimeError(f'--split-by 指定的列「{args.split_by}」不在名单里（表头为 {header}）')
+        elif args.split == 'college':
+            split_col = col_idx['学院']
+
+        date_str = f'{ev:%Y%m%d}'
+        if split_col is None:
+            name = args.name or f'上课请假证明-{date_str}.docx'
+            dst = os.path.join(args.out, name)
+            solve(src, dst, students, slot_values, sign_date, tpl['slot_ranges'])
+            print(f'\n输出: {dst}')
+            print(f'落款日期: {sign_date}  |  学生数: {len(students)}')
+            return [dst]
+
+        groups = group_indices(students_raw, split_col)
+        outputs = []
+        for label in groups:
+            idxs = groups[label]
+            sub = [students[i] for i in idxs]
+            name = split_output_name(args, '上课请假证明', label, len(groups), date_str)
+            dst = os.path.join(args.out, name)
+            print(f'\n=== {label}：{len(sub)} 人 ===')
+            solve(src, dst, sub, slot_values, sign_date, tpl['slot_ranges'])
+            outputs.append(dst)
+            print(f'输出: {dst}')
+        print(f'\n落款日期: {sign_date}  |  共 {len(groups)} 份，'
+              f'分组依据: {header[split_col]}')
+        return outputs
 
     # ---------------- 分寝室请假：按楼号分组，每栋楼一份 ----------------
     return run_dorm(src, args, info, tpl, col_idx, students_raw, stamp, sign_date)
@@ -807,12 +871,12 @@ def run_dorm(src, args, info, tpl, col_idx, students_raw, stamp, sign_date):
     if missing:
         raise RuntimeError(f'活动信息缺少字段: {missing}')
 
+    if args.split_by or args.split != 'merged':
+        print('[提示] 分寝室请假固定按寝室楼号拆分，--split/--split-by 不生效')
+
     # 寝室列：楼号 + 寝室号 拆开，楼号统一为「数字+舍」，区号丢弃
     di = col_idx['寝室号']
-
-    def cell(row, i):
-        v = row[i] if i < len(row) else ''
-        return '' if v is None else str(v).strip()
+    cell = cell_value
 
     groups, incomplete, raw_of = {}, [], {}
     for i, row in enumerate(students_raw):
@@ -846,14 +910,9 @@ def run_dorm(src, args, info, tpl, col_idx, students_raw, stamp, sign_date):
         slot_values = [norm_building(building),
                        f'{stamp["y"]}年{stamp["m"]}月{stamp["d"]}日（{stamp["wd"]}）',
                        f"参加{info['activity']}志愿者工作，{info['special_note']}，"]
-        default_name = (f'分寝室请假证明-{norm_building(building)}-'
-                        f'{stamp["y"]:04d}{stamp["m"]:02d}{stamp["d"]:02d}.docx')
-        if args.name:
-            # 多个楼号时必须在文件名里区分，否则会互相覆盖
-            stem, ext = os.path.splitext(args.name)
-            name = f'{stem}-{norm_building(building)}{ext or ".docx"}' if len(groups) > 1 else args.name
-        else:
-            name = default_name
+        date_str = f'{stamp["y"]:04d}{stamp["m"]:02d}{stamp["d"]:02d}'
+        name = split_output_name(args, '分寝室请假证明', norm_building(building),
+                                 len(groups), date_str)
         dst = os.path.join(args.out, name)
         print(f'\n=== {norm_building(building)}：{len(students)} 人'
               f'{"（含 " + str(len(red_cells)) + " 人缺寝室号，已标红）" if red_cells else ""} ===')

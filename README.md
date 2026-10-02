@@ -1,20 +1,23 @@
 # 请假证明一键生成 Skill（乙方案）
 
 面向东北电力大学青年志愿者服务站的请假证明批量生成工具。输入学生名单 + 活动信息，
-一键输出格式与模板一致的 Word 请假证明，多页时**每一页末尾都有落款**；
-确认无误后加盖印章导出 PDF。
+逐步输出：初版 Word → 盖章 Word → 最终 PDF，多页时**每一页末尾都有落款**。
 
 ## 快速开始
 
 ```powershell
 cd 请假证明生成skill
 
-# 第一步：出 Word 初版（分寝室会按楼号分成多个文件）
-python -X utf8 generate.py "样例数据\上课请假-名单.csv"
+# ① 初版（分寝室按楼号分多个文件；上课请假可选按学院拆或多份合并）
 python -X utf8 generate.py "样例数据\分寝室请假-名单.csv"
+python -X utf8 generate.py "样例数据\上课请假-名单.csv" --split college
+python -X utf8 generate.py "样例数据\上课请假-名单.csv" --split-by 班级
 
-# 第二步：确认初版后，把章印图片发过来，加盖印章并导出 PDF
+# ② 确认初版后，把章印图片发过来；这一步只出 Word 预览，不导 PDF
 python -X utf8 add_stamp.py --docx "分寝室请假证明-8舍-20261011.docx" --seal "章.png"
+
+# ③ 在 Word 里确认章的样式与位置后，导出最终 PDF
+python -X utf8 add_stamp.py --docx "分寝室请假证明-8舍-20261011_盖章.docx" --pdf
 ```
 
 ## 目录
@@ -22,9 +25,9 @@ python -X utf8 add_stamp.py --docx "分寝室请假证明-8舍-20261011.docx" --
 ```
 请假证明生成skill/
 ├── SKILL.md                  # Skill 定义
-├── generate.py               # 第一步：生成 Word 初版
-├── add_stamp.py              # 第二步：加盖印章并导出 PDF
-├── 请假证明模板填写规范.md     # 详细规范 v0.6
+├── generate.py               # ① 生成 Word 初版
+├── add_stamp.py              # ② 盖章出预览，③ 导出最终 PDF
+├── 请假证明模板填写规范.md     # 详细规范 v0.7
 ├── 样例数据/
 │   ├── 上课请假-名单.csv      # 名单（列头：学院,姓名,班级,学号）
 │   ├── 活动信息-上课请假.csv   # 活动键值对
@@ -41,6 +44,15 @@ pip install python-docx openpyxl pymupdf Pillow
 
 渲染与导出 PDF 需要本机装有 **Microsoft Word 或 WPS**（脚本依次尝试 `Word.Application` →
 `KWps.Application` → `Wps.Application`）。
+
+## 拆分方式
+
+| 表单 | 拆分 |
+|---|---|
+| 上课请假 | 默认合并输出；`--split college` 按学院拆；`--split-by <列名>` 按任意列拆 |
+| 分寝室请假 | 固定按寝室楼号拆，每栋楼一份，不提供合并 |
+
+拆分后文件名带分组值，如 `上课请假证明-外国语学院-20260923.docx`。
 
 ## 输入格式
 
@@ -70,7 +82,8 @@ pip install python-docx openpyxl pymupdf Pillow
 ## 校验保障
 
 生成后自动渲染 PDF 并逐页核验：每页题头图片、每页落款齐全、末内容为日期、无孤行/空页；
-不通过则按「每页容量 -1」单调收敛后重渲染（≤15 轮）。
+不通过则按「每页容量 -1」单调收敛后重渲染（≤15 轮）。核验顺带产出的 PDF 命名为
+`_初版预览.pdf`，**未盖章、仅供确认，不是交付物**。
 
 其他要点：
 
@@ -80,8 +93,9 @@ pip install python-docx openpyxl pymupdf Pillow
   成品只允许黑色正文与信息不全处的红色标注。
 - **表格列宽自适应**：按本批名单最长内容现算并锁定固定布局，保证每列只占一行；
   放不下时降字号，不删减任何信息。
-- **盖章**：`add_stamp.py` 把红章白底图片做透明化处理，以浮于文字上方压在落款日期处。
+- **盖章**：`add_stamp.py` 把红章白底图片做透明化处理，以浮于文字上方压在落款日期处；
+  每页落款都盖。
 
 ## 版本
 
-v1.1.0（Skill 包）。规范变更记录见《请假证明模板填写规范.md》版本说明。
+v1.2.0（Skill 包）。规范变更记录见《请假证明模板填写规范.md》版本说明。
